@@ -11,6 +11,11 @@
 #include <Ticker.h>
 Ticker Timer1;
 
+// Some constants
+#define MAX_REMOTE 20     // Maximum number of remote
+#define MAX_SHUTTER 10    // Maximum number of shutter
+#define MAX_AUX 10        // Maximum number of aux remote per shutter
+
 // Hardware I/O
 int rx_pin = D2;  // D2
 int tx_pin = D1;  // D1
@@ -31,9 +36,9 @@ int tx_led = D4;
 #define time_interframe 25*bit_length
 
 // Receiving vars
-#define max_bytes 12
-volatile bool rx_frame_buffer[max_bytes * 8];
-volatile uint8_t rx_frame_received[max_bytes];
+#define max_frame_bit 80
+volatile bool rx_frame_buffer[max_frame_bit + 1];
+volatile uint8_t rx_frame_received[(max_frame_bit / 8) + 1];
 volatile bool rx_done = false;
 volatile uint8_t rx_bit_cnt = 0;
 volatile uint8_t rx_preamble_cnt = 0;
@@ -46,8 +51,8 @@ volatile unsigned long rx_current_uS = 0;
 volatile unsigned long rx_elapsed_uS = 0;
 
 // Transmitting vars
-volatile uint8_t tx_frame_tosend[max_bytes];
-volatile bool tx_frame_buffer[max_bytes * 8];
+volatile uint8_t tx_frame_tosend[(max_frame_bit / 8) + 1];
+volatile bool tx_frame_buffer[max_frame_bit];
 volatile bool tx_start = false;
 volatile bool tx_done = true;
 volatile bool tx_newproto = false;
@@ -61,23 +66,41 @@ volatile uint8_t tx_repeat = 0;
 volatile bool tx_cc1101mode = false;
 
 // cli vars
-String cmd = "";
-String dbgdsp = "";
+std::string line = "";
+std::string dbgdsp = "";
 
 // Remote control storage
 struct RC {
   bool newprotocol = false;  // false:56 bit legacy; true:80 bit new
   bool newtiming = false;    // false:10+90ms AGC 2+7+7 preamble; true:7+10ms AGC 12+6+6 preamble
-  uint32_t remoteid = 0;
-  uint16_t channelid = 0;
+  uint16_t remoteid = 0;
+  uint8_t channelid = 0;
   uint8_t actionid = 0;
   uint16_t rollingcode = 0;
   uint8_t encryptionkey = 0xa7;
   bool updated = false;
 };
 
+RC rc[MAX_REMOTE];
 RC rx_rc;
 RC tx_rc;
+RC tmp_rc;
+
+// Shutter storage
+struct Shutter {
+  uint8_t rc_cmd_id;          // motor command remote
+  uint8_t rc_aux_id[MAX_AUX]; // aux remotes
+  bool do_relay = false;      // relay aux remote to cmd remote
+  uint8_t op_time = 0;        // operating time (s)
+  uint8_t position = 0;       // 0..100 (close to open)
+};
+
+Shutter shut[MAX_SHUTTER];
+
+// Other vars
+unsigned long currentmillis = millis();
+unsigned long lastmillis = currentmillis;
+uint32_t uptime = 0;
 
 void IRAM_ATTR handlePinInterrupt();
 
@@ -187,25 +210,44 @@ void start_tx() {
   timer1_write(100);
 }
 
-void send_frame(bool new_proto) {
-  if (new_proto)
-  {
-    tx_newproto = true;
-    tx_newtiming = true;
-    tx_bit_tosend = 80;
+void do_rolling(RC *rc) {
+  rc->encryptionkey = 0xA0 | ((rc->encryptionkey - 1) & 0x0f);
+  rc->rollingcode += 1;
+}
+
+void send_frame(RC *rc, uint8_t repeat) {
+  tx_newproto = rc->newprotocol;
+  tx_newtiming = rc->newtiming;
+  if (tx_newproto) tx_bit_tosend = 80; else tx_bit_tosend = 56;
+  
+  do_rolling(rc);
+
+  tx_frame_tosend[0] = rc->encryptionkey;
+  tx_frame_tosend[1] = rc->actionid << 4;
+  tx_frame_tosend[2] = (rc->rollingcode & 0xff00) >> 8; tx_frame_tosend[3] = rc->rollingcode & 0xff;
+  tx_frame_tosend[4] = rc->channelid;
+  tx_frame_tosend[5] = rc->remoteid & 0xff; tx_frame_tosend[6] = (rc->remoteid & 0xff00) >> 8;
+  tx_frame_tosend[7] = 0xa0; tx_frame_tosend[8] = 0x00; tx_frame_tosend[9] = 0x25;  // Temp - To be redefined
+
+  uint8_t check_digit = 0;
+  for (uint8_t idx = 0; idx < tx_bit_tosend / 8; idx++) {
+    check_digit = check_digit ^ tx_frame_tosend[idx] ^ (tx_frame_tosend[idx] >> 4);
   }
-  else {
-    tx_newproto = false;
-    tx_newtiming = false;
-    tx_bit_tosend = 56;
-  }
+  tx_frame_tosend[1] = (tx_frame_tosend[1] & 0xf0) + (check_digit & 0x0f);
 
-  tx_frame_tosend[0] = 0xA7; tx_frame_tosend[1] = 0x82; tx_frame_tosend[2] = 0x82; tx_frame_tosend[3] = 0xd5;
-  tx_frame_tosend[4] = 0xf4; tx_frame_tosend[5] = 0xe7; tx_frame_tosend[6] = 0xee;
+  tx_repeat = repeat;
 
-  tx_frame_tosend[7] = 0xaa; tx_frame_tosend[8] = 0xaa; tx_frame_tosend[9] = 0x00;
+  // Debug information of received frame on serial
+  char txt[255];
+  sprintf(txt, "Sending frame  : %i bit - %i repeat -", tx_bit_tosend, tx_repeat);
+  dbgdsp = txt;
+  for (uint8_t idx = 0; idx < tx_bit_tosend / 8; idx++) { sprintf(txt, " %02X", tx_frame_tosend[idx]); dbgdsp += txt; }
 
-  tx_repeat = 2;
+  for (uint8_t idx = 1; idx < 9; idx++) tx_frame_tosend[idx] ^= tx_frame_tosend[idx-1];
+
+  dbgdsp += " -";
+  for (uint8_t idx = 0; idx < tx_bit_tosend / 8; idx++) { sprintf(txt, " %02X", tx_frame_tosend[idx]); dbgdsp += txt; }
+
   start_tx();
 }
 
@@ -249,7 +291,7 @@ void IRAM_ATTR handlePinInterrupt() {
   }
 
   // Limit frame length to buffer length
-  if (rx_bit_cnt >= max_bytes * 8) rx_bit_cnt--;  
+  if (rx_bit_cnt >= max_frame_bit + 1) rx_bit_cnt--;  
 }
 
 
@@ -330,49 +372,149 @@ bool process_rx() {
 }
 
 
-void show_rc(RC rc) {
-  char txt[10];
-  const char ActTxt[] = "--      My      Up      My+Up   Dn      My+Dn   Up+Dn   --      Prog    Sun+FlagFlag    --      --      --      --      --      ";
-  Serial.print("Remote ID      : "); sprintf(txt, "%04X", rc.remoteid); Serial.println(txt);
-  Serial.print("Channel ID     : "); sprintf(txt, "%02X", rc.channelid); Serial.println(txt);
-  Serial.print("Encryption key : "); sprintf(txt, "%02X", rc.encryptionkey); Serial.println(txt);
-  Serial.print("Rolling code   : "); sprintf(txt, "%04X", rc.rollingcode); Serial.println(txt);
-  Serial.print("Action code    : "); sprintf(txt, "%02X", rc.actionid); Serial.println(txt);
-  Serial.print("Action         : ");
-  for (uint8_t idx = 0; idx < 7; idx++) Serial.print(ActTxt[(rc.actionid & 0x0f) * 8 + idx]);
-  Serial.println();
+bool show_rc(RC rc, int idx) {
+  if (rc.remoteid != 0 && rc.remoteid != 0xffff) {
+    char txt[12];
+    const char ActTxt[] = "--      My      Up      My+Up   Dn      My+Dn   Up+Dn   --      Prog    Sun+FlagFlag    --      --      --      --      --      ";
+    Serial.print("Remote idx     : ");
+    if (idx >= 0) { sprintf(txt, "%02i", idx); Serial.println(txt); }
+    if (idx == -1) Serial.println("Last RX");
+    if (idx == -2) Serial.println("Next TX");
+    Serial.print("Remote ID      : "); sprintf(txt, "%04X", rc.remoteid); Serial.println(txt);
+    Serial.print("Channel ID     : "); sprintf(txt, "%02X", rc.channelid); Serial.println(txt);
+    Serial.print("Encryption key : "); sprintf(txt, "%02X", rc.encryptionkey); Serial.println(txt);
+    Serial.print("Protocol       : "); if (rc.newprotocol) Serial.println("80 bits"); else Serial.println("56 bits");
+    Serial.print("Timing         : "); if (rc.newtiming) Serial.println("12 - 6 preambles"); else Serial.println("2 - 7 preambles");
+    Serial.print("Rolling code   : "); sprintf(txt, "%04X", rc.rollingcode); Serial.println(txt);
+    Serial.print("Action code    : "); sprintf(txt, "%02X", rc.actionid); Serial.println(txt);
+    Serial.print("Action         : ");
+    for (uint8_t idx = 0; idx < 7; idx++) Serial.print(ActTxt[(rc.actionid & 0x0f) * 8 + idx]);
+    Serial.println();
+    return(true);
+  }
+  return(false);
+}
+
+void show_shutter(Shutter sh, int idx) {
+  char txt[12];
+  Serial.print("Shutter idx    : "); sprintf(txt, "%02i", idx); Serial.println(txt);
+  Serial.print("Cmd remote idx : "); sprintf(txt, "%02i", sh.rc_cmd_id); Serial.println(txt);
+  Serial.print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); Serial.print(txt); }; Serial.println();
+  Serial.print("Relay Aux->Cmd : "); if (sh.do_relay) Serial.println("Yes"); else Serial.println("No");
+  Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
+  Serial.print("Position       : "); sprintf(txt, "%02i", sh.position); Serial.println(txt);
+}
+
+std::string trim(const std::string& str,
+                 const std::string& whitespace = " \t")
+{
+    const auto strBegin = str.find_first_not_of(whitespace);
+    if (strBegin == std::string::npos)
+        return ""; // no content
+
+    const auto strEnd = str.find_last_not_of(whitespace);
+    const auto strRange = strEnd - strBegin + 1;
+
+    return str.substr(strBegin, strRange);
 }
 
 void exec_cmd() {
-  switch (cmd[0]) {
-    case 'n' :
-      send_frame(true);
-      break;
-    case 'o' :
-      send_frame(false);
-      break;
-    case 's' :
-      show_rc(rx_rc);
-      break;
-    case 'w' :    
-      EEPROM.put(0, rx_rc);
+  std::string cmd = "";
+  std::string param1 = "";
+  std::string param2 = "";
+  int p1 = -1;
+  int p2 = -1;
+  uint8_t idx = 0;
+  line = trim(line);
+  while ((idx < line.length()) & (line[idx] != ' ')) {
+    cmd += line[idx];
+    idx++;
+  }
+  while ((idx < line.length()) & (line[idx] == ' ')) idx++;
+  while ((idx < line.length()) & (line[idx] != ' ')) {
+    param1 += line[idx];
+    idx++;
+  }
+  while ((idx < line.length()) & (line[idx] == ' ')) idx++;
+  while ((idx < line.length()) & (line[idx] != ' ')) {
+    param2 += line[idx];
+    idx++;
+  }
+  try { p1 = std::stoi(param1, nullptr, 0); } catch(...) {}
+  try { p2 = std::stoi(param2, nullptr, 0); } catch(...) {}
+ 
+  if ((cmd == "show") || (cmd == "sh")) {
+    if (param1 == "rx") show_rc(rx_rc, -1);
+    if (param1 == "tx") show_rc(tx_rc, -2);
+    if (param1 == "remote") {
+      if ((p2 >= 0) && (p2 < MAX_REMOTE)) show_rc(rc[p2], p2);
+      else for (idx = 0; idx < MAX_REMOTE; idx++) { if (show_rc(rc[idx], idx)) if (idx < MAX_REMOTE - 1) Serial.println(); }
+    }
+    if (param1 == "shutter") {
+      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) show_shutter(shut[p2], p2);
+      else for (idx = 0; idx < MAX_SHUTTER; idx++) { show_shutter(shut[idx], idx); if (idx < MAX_SHUTTER - 1) Serial.println(); }
+    }
+    if (param1 == "uptime") {
+      char txt[48];
+      int d = uptime/86400;
+      int h = (uptime - (d*86400)) / 3600;
+      int m = (uptime - (d*86400) - (h*3600)) / 60;
+      int s = uptime % 60;
+      sprintf(txt, "Uptime         : %4id %02ih:%02im:%02is", d, h, m, s);
+      Serial.println(txt);
+    }
+  }
+  if ((cmd == "copy") || (cmd == "cp")) {
+    tmp_rc.encryptionkey = 0xff;
+    if ((p1 >= 0) && (p1 < MAX_REMOTE)) tmp_rc = rc[p1];
+    else if (param1 == "rx") tmp_rc = rx_rc;
+    else if (param1 == "tx") tmp_rc = tx_rc;
+    if (tmp_rc.encryptionkey != 0xff) {
+      if ((p2 >= 0) && (p2 < MAX_REMOTE)) rc[p2] = tmp_rc;
+      else if (param2 == "rx") rx_rc = tmp_rc;
+      else if (param2 == "tx") tx_rc = tmp_rc;
+    }
+  }
+  if ((cmd == "roll") || (cmd == "rl")) {
+    if ((p1 >= 0) && (p1 < MAX_REMOTE)) do_rolling(&rc[p1]);
+    else if (param1 == "rx") do_rolling(&rx_rc);
+    else if (param1 == "tx") do_rolling(&tx_rc);
+  }
+  if (cmd == "save") {
+      for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.put(idx*50, rc[idx]);
+      EEPROM.put(2000, rx_rc);
+      EEPROM.put(2100, tx_rc);
+      for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.put(3000+idx*50, shut[idx]);
       EEPROM.commit();
-      break;
-    case 'r' :    
-      EEPROM.get(0, rx_rc);
-      break;
-
-   }
+  }
+  if (cmd == "load") {
+      for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.get(idx*50, rc[idx]);
+      EEPROM.get(2000, rx_rc);
+      EEPROM.get(2100, tx_rc);
+      for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.get(3000+idx*50, shut[idx]);
+  }
+  if ((cmd == "edit") || (cmd == "ed")) {
+    if (param1 == "rid") tx_rc.remoteid = p2;
+    if (param1 == "cid") tx_rc.channelid = p2;
+    if (param1 == "rc") tx_rc.rollingcode = p2;
+    if (param1 == "ac") tx_rc.actionid = p2;
+    if (param1 == "enc") tx_rc.encryptionkey = p2;
+    if (param1 == "proto" and param2 == "56") tx_rc.newprotocol = false;
+    if (param1 == "proto" and param2 == "80") tx_rc.newprotocol = true;
+  }
+  if (cmd == "send") {
+      send_frame(&tx_rc, 2);
+  }
 }
 
 void process_serial() {
 
   if (dbgdsp.length() > 0) {
-      for (unsigned int idx = 0; idx < 2+cmd.length(); idx++) Serial.print("\b \b");
-      Serial.println(dbgdsp);
+      for (unsigned int idx = 0; idx < 2+line.length(); idx++) Serial.print("\b \b");
+      Serial.println(dbgdsp.c_str());
       dbgdsp = "";
       Serial.print("> ");
-      Serial.print(cmd);
+      Serial.print(line.c_str());
   }
 
   if (Serial.available()) {
@@ -383,18 +525,20 @@ void process_serial() {
         Serial.println();
         exec_cmd();
         Serial.print("> ");
-        cmd = "";
+        line = "";
         break;
     case '\n': break;
     case '\b':
-        if (cmd.length() > 0) {
-            cmd.remove(cmd.length()-1);
+        if (line.length() > 0) {
+            line.pop_back();
             Serial.print("\b \b");
         }
         break;
     default:
-        cmd += ch;
-        Serial.print(ch);
+        if (line.length() < 80) {
+          line += ch;
+          Serial.print(ch);
+        }
         break;
     }
   }
@@ -407,7 +551,7 @@ void setup() {
     Serial.print("\nRTS Rx/Tx\n");
 
     EEPROM.begin(1024);
-
+    
     // Init CC1101 RF chip
     Serial.print("CC1101 radio module...");
     ELECHOUSE_cc1101.Init();
@@ -447,11 +591,15 @@ void setup() {
 
 
 void loop() {
+  currentmillis = millis();
+  if ((lastmillis + 1000 < currentmillis) || (currentmillis + 1000000 < lastmillis)) {
+    uptime ++;
+    lastmillis += 1000;
+  }
 
-    process_serial();
+  process_serial();
 
-    process_rx();
-    process_tx();
-
+  process_rx();
+  process_tx();
 
 }
