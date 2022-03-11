@@ -2,18 +2,30 @@
   #error This code is designed to run on ESP8266 and ESP8266-based boards!
 #endif
 
+// Include framework & embedded hardware libs
 #include <Arduino.h>
 #include <string>
-//#include <LittleFS.h>
+#include <Ticker.h>
+#include <LittleFS.h>
 #include <EEPROM.h>
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+
+// Include specific hardware libs
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 
-#include <Ticker.h>
+// Include project specific headers
+#include "cred.h"
+
+// Timer
 Ticker Timer1;
+WiFiClient espClient;
+PubSubClient mqtt_client(espClient);
+
 
 // Some constants
-#define MAX_REMOTE 20     // Maximum number of remote
-#define MAX_SHUTTER 10    // Maximum number of shutter
+#define MAX_REMOTE 40     // Maximum number of remote
+#define MAX_SHUTTER 20    // Maximum number of shutter
 #define MAX_AUX 10        // Maximum number of aux remote per shutter
 
 // Hardware I/O
@@ -69,6 +81,11 @@ volatile bool tx_cc1101mode = false;
 std::string line = "";
 std::string dbgdsp = "";
 
+// Network vars
+bool wifi_connected = false;
+bool mqtt_connected = false;
+uint8_t eeprom_to_save = 0;
+
 // Remote control storage
 struct RC {
   bool newprotocol = false;  // false:56 bit legacy; true:80 bit new
@@ -88,11 +105,13 @@ RC tmp_rc;
 
 // Shutter storage
 struct Shutter {
-  uint8_t rc_cmd_id;          // motor command remote
-  uint8_t rc_aux_id[MAX_AUX]; // aux remotes
-  bool do_relay = false;      // relay aux remote to cmd remote
-  uint8_t op_time = 0;        // operating time (s)
-  uint8_t position = 0;       // 0..100 (close to open)
+  uint8_t rc_cmd_id = 0xff;     // motor command remote
+  uint8_t rc_aux_id[MAX_AUX];   // aux remotes
+  bool do_relay = false;        // relay aux remote to cmd remote
+  uint8_t op_time = 0;          // operating time (s)
+  uint8_t position = 0;         // 0..100 (close to open)
+  uint8_t action = 0;           // current action
+  bool updated = false;
 };
 
 Shutter shut[MAX_SHUTTER];
@@ -213,6 +232,7 @@ void start_tx() {
 void do_rolling(RC *rc) {
   rc->encryptionkey = 0xA0 | ((rc->encryptionkey - 1) & 0x0f);
   rc->rollingcode += 1;
+  rc->updated = true;
 }
 
 void send_frame(RC *rc, uint8_t repeat) {
@@ -371,6 +391,29 @@ bool process_rx() {
   return((check_digit == 0));
 }
 
+void process_rxframe() {
+  if (rx_rc.updated == true) {
+    for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) {
+      if ((rx_rc.remoteid == rc[idx].remoteid) && (rx_rc.channelid == rc[idx].channelid)) {
+        if ((rx_rc.rollingcode > rc[idx].rollingcode) && (rx_rc.rollingcode < rc[idx].rollingcode + 100)) {
+          rc[idx].rollingcode = rx_rc.rollingcode;
+          rc[idx].updated = true;
+          for (uint8_t idx_shutter = 0; idx_shutter < MAX_SHUTTER; idx_shutter++)
+            for (uint8_t idx_shutter_remote = 0; idx_shutter_remote < MAX_AUX; idx_shutter_remote++) {
+              if (idx == shut[idx_shutter].rc_aux_id[idx_shutter_remote]) {
+                shut[idx_shutter].action = rx_rc.actionid;
+              }
+            }
+        }
+      }
+    }
+    rx_rc.updated = false;
+  }
+}
+
+void process_shutter() {
+
+}
 
 bool show_rc(RC rc, int idx) {
   if (rc.remoteid != 0 && rc.remoteid != 0xffff) {
@@ -402,7 +445,8 @@ void show_shutter(Shutter sh, int idx) {
   Serial.print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); Serial.print(txt); }; Serial.println();
   Serial.print("Relay Aux->Cmd : "); if (sh.do_relay) Serial.println("Yes"); else Serial.println("No");
   Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
-  Serial.print("Position       : "); sprintf(txt, "%02i", sh.position); Serial.println(txt);
+  Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
+  Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
 }
 
 std::string trim(const std::string& str,
@@ -416,6 +460,23 @@ std::string trim(const std::string& str,
     const auto strRange = strEnd - strBegin + 1;
 
     return str.substr(strBegin, strRange);
+}
+
+void data_save() {
+  for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) { rc[idx].updated = false; EEPROM.put(idx*50, rc[idx]); }
+  EEPROM.put(2000, rx_rc);
+  EEPROM.put(2100, tx_rc);
+  for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.put(3000+idx*50, shut[idx]);
+  EEPROM.commit();
+  dbgdsp = "Data saved";
+}
+
+void data_load() {
+  for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.get(idx*50, rc[idx]);
+  EEPROM.get(2000, rx_rc);
+  EEPROM.get(2100, tx_rc);
+  for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.get(3000+idx*50, shut[idx]);
+  dbgdsp = "Data loaded";
 }
 
 void exec_cmd() {
@@ -480,19 +541,25 @@ void exec_cmd() {
     else if (param1 == "rx") do_rolling(&rx_rc);
     else if (param1 == "tx") do_rolling(&tx_rc);
   }
-  if (cmd == "save") {
-      for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.put(idx*50, rc[idx]);
-      EEPROM.put(2000, rx_rc);
-      EEPROM.put(2100, tx_rc);
-      for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.put(3000+idx*50, shut[idx]);
-      EEPROM.commit();
+  if ((cmd == "link") || (cmd == "ln")) {
+    if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
+      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
+        int cmd_idx = -1;
+        for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) cmd_idx = idx;
+        if (cmd_idx < 0) for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == 0xff) { cmd_idx = idx; break; }
+        if (cmd_idx >= 0) shut[p2].rc_aux_id[cmd_idx] = p1;
+      }
+    }
   }
-  if (cmd == "load") {
-      for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.get(idx*50, rc[idx]);
-      EEPROM.get(2000, rx_rc);
-      EEPROM.get(2100, tx_rc);
-      for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) EEPROM.get(3000+idx*50, shut[idx]);
+  if ((cmd == "unlink") || (cmd == "ul")) {
+    if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
+      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
+        for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) shut[p2].rc_aux_id[idx] = 0xff;
+      }
+    }
   }
+  if (cmd == "save") data_save();
+  if (cmd == "load") data_load();
   if ((cmd == "edit") || (cmd == "ed")) {
     if (param1 == "rid") tx_rc.remoteid = p2;
     if (param1 == "cid") tx_rc.channelid = p2;
@@ -545,61 +612,139 @@ void process_serial() {
 }
 
 
+
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+
+  // Switch on the LED if an 1 was received as first character
+  if ((char)payload[0] == '1') {
+    digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
+    // but actually the LED is on; this is because
+    // it is active low on the ESP-01)
+  } else {
+    digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
+  }
+
+}
+
+
+
 void setup() {
-    // Init serial port
-    Serial.begin(115200);  
-    Serial.print("\nRTS Rx/Tx\n");
+  // Init serial port
+  Serial.begin(115200);  
+  Serial.print("\nRTS Rx/Tx\n");
 
-    EEPROM.begin(1024);
-    
-    // Init CC1101 RF chip
-    Serial.print("CC1101 radio module...");
-    ELECHOUSE_cc1101.Init();
-    ELECHOUSE_cc1101.setMHZ(FREQ);
-    if (ELECHOUSE_cc1101.getCC1101()) {
-      Serial.println();
-      Serial.print("Version   : "); Serial.println(ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION), HEX);
-      Serial.print("Frequency : "); Serial.println(FREQ);
-    }
-    else
-    {
-      Serial.println(" module not found !");
-    }
+  // Init CC1101 RF chip
+  Serial.print("CC1101 radio module...");
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setMHZ(FREQ);
+  if (ELECHOUSE_cc1101.getCC1101()) {
+    Serial.println();
+    Serial.print("Version   : "); Serial.println(ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION), HEX);
+    Serial.print("Frequency : "); Serial.println(FREQ);
+  }
+  else
+  {
+    Serial.println(" module not found !");
+  }
 
-    Serial.print("> ");
+  Serial.print("> ");
 
-    // Set Digital I/O and Interrupt handlers
-    // RX PIN, Interrupt & CC1101 receiving mode
-    pinMode(rx_pin, INPUT);
-    //attachInterrupt(digitalPinToInterrupt(rx_pin), handlePinInterrupt, CHANGE);
-    cc1101_rx();
+  EEPROM.begin(4096);
+  data_load();
+  
+  // Set Digital I/O and Interrupt handlers
+  // RX PIN, Interrupt & CC1101 receiving mode
+  pinMode(rx_pin, INPUT);
+  //attachInterrupt(digitalPinToInterrupt(rx_pin), handlePinInterrupt, CHANGE);
+  cc1101_rx();
 
-    // setup TX timer
-    delay(10);
-    pinMode(tx_pin, OUTPUT);
-    GPOC = (1 << tx_pin);
-    timer1_attachInterrupt(handleTimerInterrupt);
-    timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
+  // setup TX timer
+  delay(10);
+  pinMode(tx_pin, OUTPUT);
+  GPOC = (1 << tx_pin);
+  timer1_attachInterrupt(handleTimerInterrupt);
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
 
-    // LED
-    pinMode(rx_led, OUTPUT);
-    digitalWrite(rx_led, HIGH);
-    pinMode(tx_led, OUTPUT);
-    digitalWrite(tx_led, HIGH);
+  // LED
+  pinMode(rx_led, OUTPUT);
+  digitalWrite(rx_led, HIGH);
+  pinMode(tx_led, OUTPUT);
+  digitalWrite(tx_led, HIGH);
+
+  // Start WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PSK);
+
+
 }
 
 
 
 void loop() {
+  // every seconds processing
   currentmillis = millis();
   if ((lastmillis + 1000 < currentmillis) || (currentmillis + 1000000 < lastmillis)) {
+
+    // time management
     uptime ++;
     lastmillis += 1000;
+
+    // network management
+    if (!wifi_connected) {
+      if (WiFi.status() == WL_CONNECTED) {
+        wifi_connected = true;
+        dbgdsp = "WiFi connected - IP ";
+        dbgdsp.append(WiFi.localIP().toString().c_str());
+        mqtt_client.setServer(MQTT_IP, 1883);
+        mqtt_client.setCallback(mqtt_callback);
+      }
+    }
+    else {
+      if (!mqtt_connected){
+        if (mqtt_client.connect("ESP8266-Closer", MQTT_USER, MQTT_PASS)) {
+          mqtt_connected = true;
+          dbgdsp = "MQTT connected";
+          mqtt_client.subscribe("inTopic");
+        } else {
+          dbgdsp = "MQTT client connection failed";
+        }
+      } else if (! mqtt_client.connected()) {
+        mqtt_connected = false;
+        dbgdsp = "MQTT client disconnected";
+      }
+
+      if (WiFi.status() != WL_CONNECTED) {
+        wifi_connected = false;
+        dbgdsp = "WiFi disconnected";
+      }
+    }
+
+    // data management
+    bool updated = false;
+    for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) {
+      if (rc[idx].updated) updated = true;
+    }
+    if (updated) {
+      if (eeprom_to_save <= 0) data_save(); else eeprom_to_save--;
+    } else eeprom_to_save = 60;
   }
+
+  // every loop processing
+
+  mqtt_client.loop();
 
   process_serial();
 
   process_rx();
+  process_rxframe();
+  process_shutter();
   process_tx();
 
 }
