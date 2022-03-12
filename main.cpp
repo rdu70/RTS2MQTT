@@ -120,6 +120,8 @@ Shutter shut[MAX_SHUTTER];
 unsigned long currentmillis = millis();
 unsigned long lastmillis = currentmillis;
 uint32_t uptime = 0;
+uint8_t loopidx = 0;
+char uptime_txt[48];
 
 void IRAM_ATTR handlePinInterrupt();
 
@@ -392,21 +394,33 @@ bool process_rx() {
 }
 
 void process_rxframe() {
+  char Txt[10] = "";
+  char rc_list[3 * MAX_REMOTE + 1] = "";
+  char shut_list[3 * MAX_SHUTTER + 1] = "";
   if (rx_rc.updated == true) {
     for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) {
       if ((rx_rc.remoteid == rc[idx].remoteid) && (rx_rc.channelid == rc[idx].channelid)) {
         if ((rx_rc.rollingcode > rc[idx].rollingcode) && (rx_rc.rollingcode < rc[idx].rollingcode + 100)) {
           rc[idx].rollingcode = rx_rc.rollingcode;
+          rc[idx].encryptionkey = rx_rc.encryptionkey;
+          rc[idx].actionid = rx_rc.actionid;
           rc[idx].updated = true;
+          sprintf(Txt, " %2i", idx);
+          strcat(rc_list, Txt);
           for (uint8_t idx_shutter = 0; idx_shutter < MAX_SHUTTER; idx_shutter++)
             for (uint8_t idx_shutter_remote = 0; idx_shutter_remote < MAX_AUX; idx_shutter_remote++) {
               if (idx == shut[idx_shutter].rc_aux_id[idx_shutter_remote]) {
                 shut[idx_shutter].action = rx_rc.actionid;
+                sprintf(Txt, " %2i", idx_shutter);
+                strcat(shut_list, Txt);
               }
             }
         }
       }
     }
+    if (strlen(rc_list) == 0) strcpy(rc_list, " none");
+    if (strlen(shut_list) == 0) strcpy(shut_list, " none");
+    dbgdsp = "Remote match :" + std::string(rc_list) + " Shutter match :" + std::string(shut_list);
     rx_rc.updated = false;
   }
 }
@@ -415,8 +429,9 @@ void process_shutter() {
 
 }
 
-bool show_rc(RC rc, int idx) {
-  if (rc.remoteid != 0 && rc.remoteid != 0xffff) {
+bool show_rc(RC rc, int idx, bool force = false, bool headspace = false) {
+  if (force || (rc.remoteid != 0 && rc.remoteid != 0xffff)) {
+    if (headspace) Serial.println();
     char txt[12];
     const char ActTxt[] = "--      My      Up      My+Up   Dn      My+Dn   Up+Dn   --      Prog    Sun+FlagFlag    --      --      --      --      --      ";
     Serial.print("Remote idx     : ");
@@ -438,15 +453,20 @@ bool show_rc(RC rc, int idx) {
   return(false);
 }
 
-void show_shutter(Shutter sh, int idx) {
-  char txt[12];
-  Serial.print("Shutter idx    : "); sprintf(txt, "%02i", idx); Serial.println(txt);
-  Serial.print("Cmd remote idx : "); sprintf(txt, "%02i", sh.rc_cmd_id); Serial.println(txt);
-  Serial.print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); Serial.print(txt); }; Serial.println();
-  Serial.print("Relay Aux->Cmd : "); if (sh.do_relay) Serial.println("Yes"); else Serial.println("No");
-  Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
-  Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
-  Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
+bool show_shutter(Shutter sh, int idx, bool force = false, bool headspace = false) {
+  if (force || (sh.rc_cmd_id != 0xff) || (sh.rc_aux_id[0] != 0xff)) {  // To be optimize as 1st aux could be empty
+    if (headspace) Serial.println();
+    char txt[12];
+    Serial.print("Shutter idx    : "); sprintf(txt, "%02i", idx); Serial.println(txt);
+    Serial.print("Cmd remote idx : "); sprintf(txt, "%02i", sh.rc_cmd_id); Serial.println(txt);
+    Serial.print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); Serial.print(txt); }; Serial.println();
+    Serial.print("Relay Aux->Cmd : "); if (sh.do_relay) Serial.println("Yes"); else Serial.println("No");
+    Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
+    Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
+    Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
+    return(true);
+  }
+  return(false);
 }
 
 std::string trim(const std::string& str,
@@ -479,6 +499,14 @@ void data_load() {
   dbgdsp = "Data loaded";
 }
 
+void uptime_to_text(char const *header, char const *trailer) {
+  int d = uptime/86400;
+  int h = (uptime - (d*86400)) / 3600;
+  int m = (uptime - (d*86400) - (h*3600)) / 60;
+  int s = uptime % 60;
+  sprintf(uptime_txt, "%s%4id %02ih:%02im:%02is%s", header, d, h, m, s, trailer);
+}
+
 void exec_cmd() {
   std::string cmd = "";
   std::string param1 = "";
@@ -505,24 +533,20 @@ void exec_cmd() {
   try { p2 = std::stoi(param2, nullptr, 0); } catch(...) {}
  
   if ((cmd == "show") || (cmd == "sh")) {
-    if (param1 == "rx") show_rc(rx_rc, -1);
-    if (param1 == "tx") show_rc(tx_rc, -2);
-    if (param1 == "remote") {
-      if ((p2 >= 0) && (p2 < MAX_REMOTE)) show_rc(rc[p2], p2);
-      else for (idx = 0; idx < MAX_REMOTE; idx++) { if (show_rc(rc[idx], idx)) if (idx < MAX_REMOTE - 1) Serial.println(); }
+    bool found = false;
+    if (param1 == "rx") show_rc(rx_rc, -1, true);
+    if (param1 == "tx") show_rc(tx_rc, -2, true);
+    if (param1 == "remote" || param1 == "rc") {
+      if ((p2 >= 0) && (p2 < MAX_REMOTE)) show_rc(rc[p2], p2, true, false);
+      else for (idx = 0; idx < MAX_REMOTE; idx++) { found |= show_rc(rc[idx], idx, false, found); }
     }
-    if (param1 == "shutter") {
-      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) show_shutter(shut[p2], p2);
-      else for (idx = 0; idx < MAX_SHUTTER; idx++) { show_shutter(shut[idx], idx); if (idx < MAX_SHUTTER - 1) Serial.println(); }
+    if (param1 == "shutter" || param1 == "device" || param1 == "dev") {
+      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) show_shutter(shut[p2], p2, true, false);
+      else for (idx = 0; idx < MAX_SHUTTER; idx++) { found |= show_shutter(shut[idx], idx, false, found); }
     }
     if (param1 == "uptime") {
-      char txt[48];
-      int d = uptime/86400;
-      int h = (uptime - (d*86400)) / 3600;
-      int m = (uptime - (d*86400) - (h*3600)) / 60;
-      int s = uptime % 60;
-      sprintf(txt, "Uptime         : %4id %02ih:%02im:%02is", d, h, m, s);
-      Serial.println(txt);
+      uptime_to_text("Uptime         : ", "");
+      Serial.println(uptime_txt);
     }
   }
   if ((cmd == "copy") || (cmd == "cp")) {
@@ -578,6 +602,8 @@ void process_serial() {
 
   if (dbgdsp.length() > 0) {
       for (unsigned int idx = 0; idx < 2+line.length(); idx++) Serial.print("\b \b");
+      uptime_to_text("[", " ] ");
+      Serial.print(uptime_txt);
       Serial.println(dbgdsp.c_str());
       dbgdsp = "";
       Serial.print("> ");
@@ -617,7 +643,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
-  for (int i = 0; i < length; i++) {
+  for (unsigned int i = 0; i < length; i++) {
     Serial.print((char)payload[i]);
   }
   Serial.println();
@@ -737,14 +763,28 @@ void loop() {
   }
 
   // every loop processing
-
   mqtt_client.loop();
-
   process_serial();
 
-  process_rx();
-  process_rxframe();
-  process_shutter();
-  process_tx();
+  // once per loop processing
+  switch (loopidx++)
+  {
+  case 0:
+    process_rx();
+    break;
+  case 1:
+    process_rxframe();
+    break;
+  case 2:
+    process_shutter();
+    break;
+  case 3:
+    process_tx();
+    break;
+  
+  default:
+    loopidx = 0;
+    break;
+  }
 
 }
