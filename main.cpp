@@ -28,6 +28,15 @@ PubSubClient mqtt_client(espClient);
 #define MAX_SHUTTER 20    // Maximum number of shutter
 #define MAX_AUX 10        // Maximum number of aux remote per shutter
 
+#define SH_STATUS_CLOSED 0
+#define SH_STATUS_CLOSING 1
+#define SH_STATUS_OPEN 2
+#define SH_STATUS_OPENING 3
+
+#define MQTT_TOPIC "home-assistant/cover"
+#define MQTT_TOPIC_SUB "home-assistant/cover/#"
+#define MQTT_LWT "home-assistant/cover/availability"
+
 // Hardware I/O
 int rx_pin = D2;  // D2
 int tx_pin = D1;  // D1
@@ -111,7 +120,12 @@ struct Shutter {
   uint8_t op_time = 0;          // operating time (s)
   uint8_t position = 0;         // 0..100 (close to open)
   uint8_t action = 0;           // current action
+  uint8_t status = 0;           // current status
+  uint8_t cmd = 0;              // cmd requested
+  uint8_t remain_time = 0;      // current operation remaining time
   bool updated = false;
+  bool send_position = false;
+  bool send_status = false;
 };
 
 Shutter shut[MAX_SHUTTER];
@@ -425,8 +439,47 @@ void process_rxframe() {
   }
 }
 
-void process_shutter() {
-
+void process_shutter(bool is_second) {
+  for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) {
+    switch (shut[idx].action) {
+      case 0:
+              break;
+      case 2: // Up
+              if (is_second && (shut[idx].position < 100)) {
+                if (shut[idx].op_time != 0) shut[idx].position += (100 / shut[idx].op_time); else shut[idx].position = 100;
+                if (shut[idx].position > 100) shut[idx].position = 100;
+                shut[idx].updated = true;
+                shut[idx].send_position = true;
+              }
+              if (shut[idx].status != SH_STATUS_OPENING) {
+                shut[idx].status = SH_STATUS_OPENING;
+                shut[idx].send_status = true;
+              }
+              if (shut[idx].position == 100) {
+                shut[idx].status = SH_STATUS_OPEN;
+                shut[idx].send_status = true;
+                shut[idx].action = 0;
+              }
+              break;
+      case 4: // Down
+              if (is_second && (shut[idx].position > 0)) {
+                if (shut[idx].op_time != 0) shut[idx].position -= (100 / shut[idx].op_time); else shut[idx].position = 0;
+                if (shut[idx].position > 100) shut[idx].position = 0;  // overflow on previous substraction
+                shut[idx].updated = true;
+                shut[idx].send_position = true;
+              }
+              if (shut[idx].status != SH_STATUS_CLOSING) {
+                shut[idx].status = SH_STATUS_CLOSING;
+                shut[idx].send_status = true;
+              }
+              if (shut[idx].position == 0) {
+                shut[idx].status = SH_STATUS_CLOSED;
+                shut[idx].send_status = true;
+                shut[idx].action = 0;
+              }
+              break;
+    }
+  }
 }
 
 bool show_rc(RC rc, int idx, bool force = false, bool headspace = false) {
@@ -464,6 +517,7 @@ bool show_shutter(Shutter sh, int idx, bool force = false, bool headspace = fals
     Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
     Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
     Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
+    Serial.print("Command        : "); sprintf(txt, "%03i", sh.cmd); Serial.println(txt);
     return(true);
   }
   return(false);
@@ -511,8 +565,10 @@ void exec_cmd() {
   std::string cmd = "";
   std::string param1 = "";
   std::string param2 = "";
+  std::string param3 = "";
   int p1 = -1;
   int p2 = -1;
+  int p3 = -1;
   uint8_t idx = 0;
   line = trim(line);
   while ((idx < line.length()) & (line[idx] != ' ')) {
@@ -529,8 +585,14 @@ void exec_cmd() {
     param2 += line[idx];
     idx++;
   }
+  while ((idx < line.length()) & (line[idx] == ' ')) idx++;
+  while ((idx < line.length()) & (line[idx] != ' ')) {
+    param3 += line[idx];
+    idx++;
+  }
   try { p1 = std::stoi(param1, nullptr, 0); } catch(...) {}
   try { p2 = std::stoi(param2, nullptr, 0); } catch(...) {}
+  try { p3 = std::stoi(param3, nullptr, 0); } catch(...) {}
  
   if ((cmd == "show") || (cmd == "sh")) {
     bool found = false;
@@ -593,6 +655,12 @@ void exec_cmd() {
     if (param1 == "proto" and param2 == "56") tx_rc.newprotocol = false;
     if (param1 == "proto" and param2 == "80") tx_rc.newprotocol = true;
   }
+  if ((cmd == "device") || (cmd == "dev")) {
+    if ((p2 > 0) && (p2 < MAX_SHUTTER)) {
+      if ((param1 == "opt") && (p3 >= 0) && (p3 <= 100)) shut[p2].op_time = p3;
+      if ((param1 == "pos") && (p3 >= 0) && (p3 <= 100)) { shut[p2].position = p3; shut[p2].send_position = true; }
+    }
+  }
   if (cmd == "send") {
       send_frame(&tx_rc, 2);
   }
@@ -637,29 +705,45 @@ void process_serial() {
   }
 }
 
-
-
-void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-  for (unsigned int i = 0; i < length; i++) {
-    Serial.print((char)payload[i]);
+void process_mqtt() {
+  if (mqtt_client.connected()) {
+    for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) {
+      char topic[80];
+      char value[40];
+      if (shut[idx].send_position) {
+        sprintf(topic, "%s/%i/position", MQTT_TOPIC, idx);
+        sprintf(value, "%i", shut[idx].position);
+        mqtt_client.publish(topic, value, true);
+        shut[idx].send_position = false;
+        return;  // Send only one per loop
+      } 
+      if (shut[idx].send_status) {
+        sprintf(topic, "%s/%i/state", MQTT_TOPIC, idx);
+        switch (shut[idx].status) {
+          case SH_STATUS_CLOSED:  mqtt_client.publish(topic, "closed", true); break;
+          case SH_STATUS_CLOSING: mqtt_client.publish(topic, "closing", true); break;
+          case SH_STATUS_OPEN:    mqtt_client.publish(topic, "open", true); break;
+          case SH_STATUS_OPENING: mqtt_client.publish(topic, "opening", true); break;
+        }
+        shut[idx].send_status = false;
+        return; // Send only one per loop
+      } 
+    }
   }
-  Serial.println();
-
-  // Switch on the LED if an 1 was received as first character
-  if ((char)payload[0] == '1') {
-    digitalWrite(BUILTIN_LED, LOW);   // Turn the LED on (Note that LOW is the voltage level
-    // but actually the LED is on; this is because
-    // it is active low on the ESP-01)
-  } else {
-    digitalWrite(BUILTIN_LED, HIGH);  // Turn the LED off by making the voltage HIGH
-  }
-
 }
 
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  char value[10] = "";
+  uint8_t idx = 0;
+  while ((idx < length) && (idx < sizeof(value) - 2)) {
+    value[idx] = (char)payload[idx];
+    idx++;
+  }
+  value[idx] = '\0';
+  dbgdsp = "Message arrived [" + std::string(topic) + "] " + std::string(value);
 
+  //mqtt_client.publish(topic, "", false); 
+}
 
 void setup() {
   // Init serial port
@@ -667,6 +751,7 @@ void setup() {
   Serial.print("\nRTS Rx/Tx\n");
 
   // Init CC1101 RF chip
+  delay(100);
   Serial.print("CC1101 radio module...");
   ELECHOUSE_cc1101.Init();
   ELECHOUSE_cc1101.setMHZ(FREQ);
@@ -708,12 +793,13 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PSK);
 
-
 }
 
 
 
 void loop() {
+
+
   // every seconds processing
   currentmillis = millis();
   if ((lastmillis + 1000 < currentmillis) || (currentmillis + 1000000 < lastmillis)) {
@@ -721,6 +807,8 @@ void loop() {
     // time management
     uptime ++;
     lastmillis += 1000;
+
+    process_shutter(true);
 
     // network management
     if (!wifi_connected) {
@@ -734,10 +822,11 @@ void loop() {
     }
     else {
       if (!mqtt_connected){
-        if (mqtt_client.connect("ESP8266-Closer", MQTT_USER, MQTT_PASS)) {
+        if (mqtt_client.connect("ESP8266-Closer", MQTT_USER, MQTT_PASS, MQTT_LWT, 1, true, "offline")) {
           mqtt_connected = true;
           dbgdsp = "MQTT connected";
-          mqtt_client.subscribe("inTopic");
+          mqtt_client.publish(MQTT_LWT, "online", true);
+          mqtt_client.subscribe(MQTT_TOPIC_SUB);
         } else {
           dbgdsp = "MQTT client connection failed";
         }
@@ -776,12 +865,15 @@ void loop() {
     process_rxframe();
     break;
   case 2:
-    process_shutter();
+    process_shutter(false);
     break;
   case 3:
     process_tx();
     break;
-  
+  case 4:
+    process_mqtt();
+    break;
+
   default:
     loopidx = 0;
     break;
