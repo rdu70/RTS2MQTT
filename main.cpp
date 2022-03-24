@@ -33,7 +33,7 @@ PubSubClient mqtt_client(espClient);
 #define SH_STATUS_OPEN 2
 #define SH_STATUS_OPENING 3
 
-#define MQTT_TOPIC "home-assistant/cover"
+#define MQTT_TOPIC "home-assistant/cover/"
 #define MQTT_TOPIC_SUB "home-assistant/cover/#"
 #define MQTT_LWT "home-assistant/cover/availability"
 
@@ -94,6 +94,7 @@ std::string dbgdsp = "";
 bool wifi_connected = false;
 bool mqtt_connected = false;
 uint8_t eeprom_to_save = 0;
+uint8_t cmd_clear = 255;
 
 // Remote control storage
 struct RC {
@@ -126,6 +127,7 @@ struct Shutter {
   bool updated = false;
   bool send_position = false;
   bool send_status = false;
+  uint8_t send_cmd = 0;
 };
 
 Shutter shut[MAX_SHUTTER];
@@ -233,6 +235,7 @@ void process_tx() {
   if (tx_done && tx_cc1101mode) cc1101_rx();
 }
 
+bool process_rx();
 void start_tx() {
   // Serialize frame to bit buffer
   for (uint8_t idx = 0; idx < tx_bit_tosend; idx++) {
@@ -285,6 +288,10 @@ void send_frame(RC *rc, uint8_t repeat) {
   for (uint8_t idx = 0; idx < tx_bit_tosend / 8; idx++) { sprintf(txt, " %02X", tx_frame_tosend[idx]); dbgdsp += txt; }
 
   start_tx();
+
+  rx_rc = tx_rc;
+  rx_rc.updated = true;
+  process_rx();
 }
 
 void IRAM_ATTR handlePinInterrupt() {
@@ -409,7 +416,7 @@ bool process_rx() {
 
 void process_rxframe() {
   char Txt[10] = "";
-  char rc_list[3 * MAX_REMOTE + 1] = "";
+  char rc_list[3 * (MAX_REMOTE + 1) + 1] = "";
   char shut_list[3 * MAX_SHUTTER + 1] = "";
   if (rx_rc.updated == true) {
     for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) {
@@ -421,14 +428,20 @@ void process_rxframe() {
           rc[idx].updated = true;
           sprintf(Txt, " %2i", idx);
           strcat(rc_list, Txt);
-          for (uint8_t idx_shutter = 0; idx_shutter < MAX_SHUTTER; idx_shutter++)
+          for (uint8_t idx_shutter = 0; idx_shutter < MAX_SHUTTER; idx_shutter++) {
+            if (idx == shut[idx_shutter].rc_cmd_id) {
+                shut[idx_shutter].action = rx_rc.actionid;
+                sprintf(Txt, " %2i", idx_shutter);
+                strcat(shut_list, Txt);
+            }
             for (uint8_t idx_shutter_remote = 0; idx_shutter_remote < MAX_AUX; idx_shutter_remote++) {
-              if (idx == shut[idx_shutter].rc_aux_id[idx_shutter_remote]) {
+              if ((idx == shut[idx_shutter].rc_aux_id[idx_shutter_remote]) && (idx != shut[idx_shutter].rc_cmd_id)) {
                 shut[idx_shutter].action = rx_rc.actionid;
                 sprintf(Txt, " %2i", idx_shutter);
                 strcat(shut_list, Txt);
               }
             }
+          }
         }
       }
     }
@@ -443,6 +456,11 @@ void process_shutter(bool is_second) {
   for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) {
     switch (shut[idx].action) {
       case 0:
+              break;
+      case 1:
+              if (shut[idx].position > 30) shut[idx].status = SH_STATUS_OPEN; else shut[idx].status = SH_STATUS_CLOSED;
+              shut[idx].send_status = true;
+              shut[idx].action = 0;
               break;
       case 2: // Up
               if (is_second && (shut[idx].position < 100)) {
@@ -476,6 +494,32 @@ void process_shutter(bool is_second) {
                 shut[idx].status = SH_STATUS_CLOSED;
                 shut[idx].send_status = true;
                 shut[idx].action = 0;
+              }
+              break;
+    }
+    switch (shut[idx].send_cmd) { 
+      case 1:
+              shut[idx].send_cmd = 0;
+              if ((shut[idx].rc_cmd_id >= 0) && (shut[idx].rc_cmd_id < MAX_REMOTE)) {
+                tx_rc = rc[shut[idx].rc_cmd_id];
+                tx_rc.actionid = 1;
+                send_frame(&tx_rc, 2);
+              }
+              break;
+      case 2:
+              shut[idx].send_cmd = 0;
+              if ((shut[idx].rc_cmd_id >= 0) && (shut[idx].rc_cmd_id < MAX_REMOTE)) {
+                tx_rc = rc[shut[idx].rc_cmd_id];
+                tx_rc.actionid = 2;
+                send_frame(&tx_rc, 2);
+              }
+              break;
+      case 4:
+              shut[idx].send_cmd = 0;
+              if ((shut[idx].rc_cmd_id >= 0) && (shut[idx].rc_cmd_id < MAX_REMOTE)) {
+                tx_rc = rc[shut[idx].rc_cmd_id];
+                tx_rc.actionid = 4;
+                send_frame(&tx_rc, 2);
               }
               break;
     }
@@ -517,7 +561,7 @@ bool show_shutter(Shutter sh, int idx, bool force = false, bool headspace = fals
     Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
     Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
     Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
-    Serial.print("Command        : "); sprintf(txt, "%03i", sh.cmd); Serial.println(txt);
+    Serial.print("Command        : "); sprintf(txt, "%03i", sh.send_cmd); Serial.println(txt);
     return(true);
   }
   return(false);
@@ -646,7 +690,7 @@ void exec_cmd() {
   }
   if (cmd == "save") data_save();
   if (cmd == "load") data_load();
-  if ((cmd == "edit") || (cmd == "ed")) {
+  if ((cmd == "rcedit") || (cmd == "rced")) {
     if (param1 == "rid") tx_rc.remoteid = p2;
     if (param1 == "cid") tx_rc.channelid = p2;
     if (param1 == "rc") tx_rc.rollingcode = p2;
@@ -655,8 +699,9 @@ void exec_cmd() {
     if (param1 == "proto" and param2 == "56") tx_rc.newprotocol = false;
     if (param1 == "proto" and param2 == "80") tx_rc.newprotocol = true;
   }
-  if ((cmd == "device") || (cmd == "dev")) {
+  if ((cmd == "devedit") || (cmd == "ded")) {
     if ((p2 > 0) && (p2 < MAX_SHUTTER)) {
+      if ((param1 == "cmd") && (p3 >= 0) && (p3 < MAX_REMOTE)) { shut[p2].rc_cmd_id = p3; }
       if ((param1 == "opt") && (p3 >= 0) && (p3 <= 100)) shut[p2].op_time = p3;
       if ((param1 == "pos") && (p3 >= 0) && (p3 <= 100)) { shut[p2].position = p3; shut[p2].send_position = true; }
     }
@@ -706,30 +751,50 @@ void process_serial() {
 }
 
 void process_mqtt() {
+  char topic[80];
+  char value[40];
   if (mqtt_client.connected()) {
+    if (cmd_clear != 255) {
+        sprintf(topic, "%s%i/set", MQTT_TOPIC, cmd_clear);
+        mqtt_client.publish(topic, "", true);
+        cmd_clear = 255;
+        return;
+    }
     for (uint8_t idx = 0; idx < MAX_SHUTTER; idx++) {
-      char topic[80];
-      char value[40];
       if (shut[idx].send_position) {
-        sprintf(topic, "%s/%i/position", MQTT_TOPIC, idx);
+        sprintf(topic, "%s%i/position", MQTT_TOPIC, idx);
         sprintf(value, "%i", shut[idx].position);
         mqtt_client.publish(topic, value, true);
         shut[idx].send_position = false;
         return;  // Send only one per loop
       } 
       if (shut[idx].send_status) {
-        sprintf(topic, "%s/%i/state", MQTT_TOPIC, idx);
+        sprintf(topic, "%s%i/state", MQTT_TOPIC, idx);
         switch (shut[idx].status) {
-          case SH_STATUS_CLOSED:  mqtt_client.publish(topic, "closed", true); break;
-          case SH_STATUS_CLOSING: mqtt_client.publish(topic, "closing", true); break;
-          case SH_STATUS_OPEN:    mqtt_client.publish(topic, "open", true); break;
-          case SH_STATUS_OPENING: mqtt_client.publish(topic, "opening", true); break;
+          case SH_STATUS_CLOSED:  mqtt_client.publish(topic, "closed", true); cmd_clear = idx; break;
+          case SH_STATUS_CLOSING: mqtt_client.publish(topic, "closing", true); cmd_clear = idx; break;
+          case SH_STATUS_OPEN:    mqtt_client.publish(topic, "open", true); cmd_clear = idx; break;
+          case SH_STATUS_OPENING: mqtt_client.publish(topic, "opening", true); cmd_clear = idx; break;
         }
         shut[idx].send_status = false;
         return; // Send only one per loop
       } 
     }
   }
+}
+
+char *strremove(char *str, const char *sub) {
+    char *p, *q, *r;
+    if (*sub && (q = r = strstr(str, sub)) != NULL) {
+        size_t len = strlen(sub);
+        while ((r = strstr(p = r + len, sub)) != NULL) {
+            while (p < r)
+                *q++ = *p++;
+        }
+        while ((*q++ = *p++) != '\0')
+            continue;
+    }
+    return str;
 }
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
@@ -742,13 +807,23 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   value[idx] = '\0';
   dbgdsp = "Message arrived [" + std::string(topic) + "] " + std::string(value);
 
-  //mqtt_client.publish(topic, "", false); 
+  strremove(topic, MQTT_TOPIC);
+  int id = 0;
+  try { id = std::stoi(topic, nullptr, 0); } catch(...) {}
+  if ((id > 0) && (id < MAX_SHUTTER)) {
+    char *p = strstr(topic, "/set");
+    if (p > 0) {
+      if (strstr(value, "CLOSE")) shut[id].send_cmd = 4;
+      if (strstr(value, "OPEN")) shut[id].send_cmd = 2;
+      if (strstr(value, "STOP")) shut[id].send_cmd = 1;
+    }
+  }
 }
 
 void setup() {
   // Init serial port
   Serial.begin(115200);  
-  Serial.print("\nRTS Rx/Tx\n");
+  Serial.print("\nRTS / SIMU Hz Smart controller\n");
 
   // Init CC1101 RF chip
   delay(100);
