@@ -8,6 +8,7 @@ You can record your real hardware remote (40 memory slots for remotes) and link 
 Data are stored on ESP flash to keep definition and rolling codes when power lost.
 
 RX/TX are done usign OOK modulation at 433.42 MHz.  This is slightly different that usual 433 transmitter.  For best coverage and good signal, it's important to use the correct frequency, so a CC1101 module is used (programmable frequency).
+![This is an image](doc/CC1101.jpeg)
 
 Credit:This project has be done by reverse engineering some real frame generated with real hardware remote and also by some informations found on the Internet about the RTS protocol.
 
