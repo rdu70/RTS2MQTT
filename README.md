@@ -76,8 +76,6 @@ Closer/Shutter parameter
 | pos | current position (0..100) |
 
 
-## MQTT
-/ home-assistant / cover / cover number (0..9) / { set - position - state - availability }
 
 ## Sample commands
 ```
@@ -108,6 +106,41 @@ Command        : 000
 > save
 > sh uptime
 Uptime         :    0d 02h:46m:16s
+```
+
+## MQTT
+- Send command through MQTT:
+  - /home-assistant/cover/*cover number (0..9)*/**set**  -->  OPEN / CLOSE / STOP
+- Get status from MQTT:
+  - /home-assistant/cover/*cover number (0..9)*/**position**  --> 0..100
+  - /home-assistant/cover/*cover number (0..9)*/**state**   -->  open / opening / closed / closing
+  - /home-assistant/cover/*cover number (0..9)*/**availability**  -->  online / offline
+ 
+Sample Home Assistant yaml config:
+```
+mqtt:
+  cover:
+    - name: "Salon"
+      command_topic: "home-assistant/cover/1/set"
+      state_topic: "home-assistant/cover/1/state"
+      position_topic: "home-assistant/cover/1/position"
+      availability:
+        - topic: "home-assistant/cover/availability"
+      qos: 0
+      retain: true
+      payload_open: "OPEN"
+      payload_close: "CLOSE"
+      payload_stop: "STOP"
+      state_open: "open"
+      state_opening: "opening"
+      state_closed: "closed"
+      state_closing: "closing"
+      payload_available: "online"
+      payload_not_available: "offline"
+      optimistic: false
+      position_open: 100
+      position_closed: 0
+      value_template: "{{ value.x }}"
 ```
 
 # Credit / Links
