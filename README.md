@@ -7,8 +7,23 @@ You can record your real hardware remote (40 memory slots for remotes) and link 
 
 Data are stored on ESP flash to keep definition and rolling codes when power lost.
 
-RX/TX are done usign OOK modulation at 433.42 MHz.  This is slightly different that usual 433 transmitter.  For best coverage and good signal, it's important to use the correct frequency, so a CC1101 module is used (programmable frequency).
+RX/TX are done usign OOK modulation at 433.42 MHz.  This is slightly different that usual 433 transmitter.  For best coverage and good signal, it's important to use the correct frequency, so a CC1101 module with external antenna is used.
+
 ![This is an image](doc/CC1101.jpeg)
+
+| WeMOS D1 mini PIN (ESP8266 PIN) | CC1101 PIN (8 PIN Header) | (10 PIN Header) | LED |
+| --- | --- | --- | --- |
+| GND | GND (1) | (9 + 10) ||
+| 3V3 | VCC (2) | (1 + 2) ||
+| D1 (GPIO5) | GDO0 IN (3) | (8) ||
+| D8  (GPIO15) | CSN (4) | (7) ||
+| D5 (GPIO14/SCK) | SCK (5) | (4) ||
+| D7 (GPIO13/MOSI) | MOSI (6) | (3) ||
+| D6 (GPIO12/MISO) | MISO (7) | (5) ||
+| D2 (GPIO4) | GDO2 OUT (8) | (6) ||
+| D3 (GPIO0) | --- | --- | 330R + Green LED to 3V3 |
+| D4 (GPIO2) | --- | --- | 330R + Red LED to 3V3 |
+
 
 Credit:This project has be done by reverse engineering some real frame generated with real hardware remote and also by some informations found on the Internet about the RTS protocol.
 
