@@ -10,6 +10,7 @@
 #include <EEPROM.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include "ota.h"
 
 // Include specific hardware libs
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
@@ -33,9 +34,9 @@ PubSubClient mqtt_client(espClient);
 #define SH_STATUS_OPEN 2
 #define SH_STATUS_OPENING 3
 
-#define MQTT_TOPIC "home-assistant/cover/"
-#define MQTT_TOPIC_SUB "home-assistant/cover/#"
-#define MQTT_LWT "home-assistant/cover/availability"
+#define MQTT_TOPIC "home/cover/"
+#define MQTT_TOPIC_SUB "home/cover/#"
+#define MQTT_LWT "home/cover/availability"
 
 // Hardware I/O
 int rx_pin = D2;  // D2
@@ -85,6 +86,13 @@ volatile uint8_t tx_bit_cnt = 0;
 volatile bool tx_next_bit = 0;
 volatile uint8_t tx_repeat = 0;
 volatile bool tx_cc1101mode = false;
+
+// netcli vars
+bool netcli_connected = false;
+bool netcli_disconnect = false;
+bool cmd_enabled = false;
+WiFiClient cli_client;
+WiFiServer cli_server(23);
 
 // cli vars
 std::string line = "";
@@ -526,25 +534,44 @@ void process_shutter(bool is_second) {
   }
 }
 
-bool show_rc(RC rc, int idx, bool force = false, bool headspace = false) {
+void cli_print(String msg, bool ln = false, bool sercli=true, bool netcli=true)
+{
+  if (sercli) { if (ln) Serial.println(msg); else Serial.print(msg); }
+  if (netcli){
+    if (netcli_connected) {
+      cli_client.write(msg.c_str());
+      if (ln) cli_client.write("\r\n");
+    }
+  }
+}
+
+bool show_rc(RC rc, int idx, bool force = false, bool headspace = false, bool tabular = false) {
   if (force || (rc.remoteid != 0 && rc.remoteid != 0xffff)) {
-    if (headspace) Serial.println();
-    char txt[12];
+    if (headspace) cli_print("", true);
+    char txt[40];
     const char ActTxt[] = "--      My      Up      My+Up   Dn      My+Dn   Up+Dn   --      Prog    Sun+FlagFlag    --      --      --      --      --      ";
-    Serial.print("Remote idx     : ");
-    if (idx >= 0) { sprintf(txt, "%02i", idx); Serial.println(txt); }
-    if (idx == -1) Serial.println("Last RX");
-    if (idx == -2) Serial.println("Next TX");
-    Serial.print("Remote ID      : "); sprintf(txt, "%04X", rc.remoteid); Serial.println(txt);
-    Serial.print("Channel ID     : "); sprintf(txt, "%02X", rc.channelid); Serial.println(txt);
-    Serial.print("Encryption key : "); sprintf(txt, "%02X", rc.encryptionkey); Serial.println(txt);
-    Serial.print("Protocol       : "); if (rc.newprotocol) Serial.println("80 bits"); else Serial.println("56 bits");
-    Serial.print("Timing         : "); if (rc.newtiming) Serial.println("12 - 6 preambles"); else Serial.println("2 - 7 preambles");
-    Serial.print("Rolling code   : "); sprintf(txt, "%04X", rc.rollingcode); Serial.println(txt);
-    Serial.print("Action code    : "); sprintf(txt, "%02X", rc.actionid); Serial.println(txt);
-    Serial.print("Action         : ");
-    for (uint8_t idx = 0; idx < 7; idx++) Serial.print(ActTxt[(rc.actionid & 0x0f) * 8 + idx]);
-    Serial.println();
+    if (tabular) {
+      if (idx >=0) { sprintf(txt, "ID:%02i", idx); cli_print(txt, false); }
+      if (idx == -1) cli_print("ID:RX", false);
+      if (idx == -2) cli_print("ID:TX", false);
+      sprintf(txt, " RID:%04X CID:%02X ENC:%02X RC:%04X ACT:%02X ", rc.remoteid, rc.channelid, rc.encryptionkey, rc.rollingcode, rc.actionid);
+      cli_print(txt, false);
+    } else {
+      cli_print("Remote idx     : ");
+      if (idx >= 0) { sprintf(txt, "%02i", idx); cli_print(txt, true); }
+      if (idx == -1) cli_print("Last RX", true);
+      if (idx == -2) cli_print("Next TX", true);
+      cli_print("Remote ID      : "); sprintf(txt, "%04X", rc.remoteid); cli_print(txt, true);
+      cli_print("Channel ID     : "); sprintf(txt, "%02X", rc.channelid); cli_print(txt, true);
+      cli_print("Encryption key : "); sprintf(txt, "%02X", rc.encryptionkey); cli_print(txt, true);
+      cli_print("Protocol       : "); if (rc.newprotocol) cli_print("80 bits", true); else cli_print("56 bits", true);
+      cli_print("Timing         : "); if (rc.newtiming) cli_print("12 - 6 preambles", true); else cli_print("2 - 7 preambles", true);
+      cli_print("Rolling code   : "); sprintf(txt, "%04X", rc.rollingcode); cli_print(txt, true);
+      cli_print("Action code    : "); sprintf(txt, "%02X", rc.actionid); cli_print(txt, true);
+      cli_print("Action         : ");
+    }
+      for (uint8_t idx = 0; idx < 7; idx++) { sprintf(txt, "%1c", ActTxt[(rc.actionid & 0x0f) * 8 + idx]); cli_print(txt); }
+      cli_print("", true);
     return(true);
   }
   return(false);
@@ -552,16 +579,16 @@ bool show_rc(RC rc, int idx, bool force = false, bool headspace = false) {
 
 bool show_shutter(Shutter sh, int idx, bool force = false, bool headspace = false) {
   if (force || (sh.rc_cmd_id != 0xff) || (sh.rc_aux_id[0] != 0xff)) {  // To be optimize as 1st aux could be empty
-    if (headspace) Serial.println();
+    if (headspace) cli_print("", true);
     char txt[12];
-    Serial.print("Shutter idx    : "); sprintf(txt, "%02i", idx); Serial.println(txt);
-    Serial.print("Cmd remote idx : "); sprintf(txt, "%02i", sh.rc_cmd_id); Serial.println(txt);
-    Serial.print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); Serial.print(txt); }; Serial.println();
-    Serial.print("Relay Aux->Cmd : "); if (sh.do_relay) Serial.println("Yes"); else Serial.println("No");
-    Serial.print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); Serial.println(txt);
-    Serial.print("Action         : "); sprintf(txt, "%02x", sh.action); Serial.println(txt);
-    Serial.print("Position       : "); sprintf(txt, "%03i", sh.position); Serial.println(txt);
-    Serial.print("Command        : "); sprintf(txt, "%03i", sh.send_cmd); Serial.println(txt);
+    cli_print("Shutter idx    : "); sprintf(txt, "%02i", idx); cli_print(txt, true);
+    cli_print("Cmd remote idx : "); sprintf(txt, "%02i", sh.rc_cmd_id); cli_print(txt, true);
+    cli_print("Aux remote idx :"); for (int i = 0; i<MAX_AUX; i++) { sprintf(txt, " %02i", sh.rc_aux_id[i]); cli_print(txt); }; cli_print("", true);
+    cli_print("Relay Aux->Cmd : "); if (sh.do_relay) cli_print("Yes", true); else cli_print("No", true);
+    cli_print("Open/Close time: "); sprintf(txt, "%02i", sh.op_time); cli_print(txt, true);
+    cli_print("Action         : "); sprintf(txt, "%02x", sh.action); cli_print(txt, true);
+    cli_print("Position       : "); sprintf(txt, "%03i", sh.position); cli_print(txt, true);
+    cli_print("Command        : "); sprintf(txt, "%03i", sh.send_cmd); cli_print(txt, true);
     return(true);
   }
   return(false);
@@ -638,79 +665,98 @@ void exec_cmd() {
   try { p2 = std::stoi(param2, nullptr, 0); } catch(...) {}
   try { p3 = std::stoi(param3, nullptr, 0); } catch(...) {}
  
-  if ((cmd == "show") || (cmd == "sh")) {
-    bool found = false;
-    if (param1 == "rx") show_rc(rx_rc, -1, true);
-    if (param1 == "tx") show_rc(tx_rc, -2, true);
-    if (param1 == "remote" || param1 == "rc") {
-      if ((p2 >= 0) && (p2 < MAX_REMOTE)) show_rc(rc[p2], p2, true, false);
-      else for (idx = 0; idx < MAX_REMOTE; idx++) { found |= show_rc(rc[idx], idx, false, found); }
-    }
-    if (param1 == "shutter" || param1 == "device" || param1 == "dev") {
-      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) show_shutter(shut[p2], p2, true, false);
-      else for (idx = 0; idx < MAX_SHUTTER; idx++) { found |= show_shutter(shut[idx], idx, false, found); }
-    }
-    if (param1 == "uptime") {
-      uptime_to_text("Uptime         : ", "");
-      Serial.println(uptime_txt);
-    }
-  }
-  if ((cmd == "copy") || (cmd == "cp")) {
-    tmp_rc.encryptionkey = 0xff;
-    if ((p1 >= 0) && (p1 < MAX_REMOTE)) tmp_rc = rc[p1];
-    else if (param1 == "rx") tmp_rc = rx_rc;
-    else if (param1 == "tx") tmp_rc = tx_rc;
-    if (tmp_rc.encryptionkey != 0xff) {
-      if ((p2 >= 0) && (p2 < MAX_REMOTE)) rc[p2] = tmp_rc;
-      else if (param2 == "rx") rx_rc = tmp_rc;
-      else if (param2 == "tx") tx_rc = tmp_rc;
-    }
-  }
-  if ((cmd == "roll") || (cmd == "rl")) {
-    if ((p1 >= 0) && (p1 < MAX_REMOTE)) do_rolling(&rc[p1]);
-    else if (param1 == "rx") do_rolling(&rx_rc);
-    else if (param1 == "tx") do_rolling(&tx_rc);
-  }
-  if ((cmd == "link") || (cmd == "ln")) {
-    if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
-      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
-        int cmd_idx = -1;
-        for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) cmd_idx = idx;
-        if (cmd_idx < 0) for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == 0xff) { cmd_idx = idx; break; }
-        if (cmd_idx >= 0) shut[p2].rc_aux_id[cmd_idx] = p1;
+  if (cmd_enabled) {
+    if ((cmd == "show") || (cmd == "sh")) {
+      bool found = false;
+      if (param1 == "rx") show_rc(rx_rc, -1, true);
+      if (param1 == "tx") show_rc(tx_rc, -2, true);
+      if (param1 == "remote" || param1 == "rc") {
+        if ((p2 >= 0) && (p2 < MAX_REMOTE)) show_rc(rc[p2], p2, true, false);
+        else for (idx = 0; idx < MAX_REMOTE; idx++) { found |= show_rc(rc[idx], idx, false, found); }
+      }
+      if (param1 == "rcs") {
+        for (idx = 0; idx < MAX_REMOTE; idx++) { found |= show_rc(rc[idx], idx, false, found, true); }
+      }
+      if (param1 == "shutter" || param1 == "device" || param1 == "dev") {
+        if ((p2 >= 0) && (p2 < MAX_SHUTTER)) show_shutter(shut[p2], p2, true, false);
+        else for (idx = 0; idx < MAX_SHUTTER; idx++) { found |= show_shutter(shut[idx], idx, false, found); }
+      }
+      if (param1 == "uptime") {
+        uptime_to_text("Uptime         : ", "");
+        cli_print(uptime_txt, true);
       }
     }
-  }
-  if ((cmd == "unlink") || (cmd == "ul")) {
-    if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
-      if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
-        for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) shut[p2].rc_aux_id[idx] = 0xff;
+    if ((cmd == "copy") || (cmd == "cp")) {
+      tmp_rc.encryptionkey = 0xff;
+      if ((p1 >= 0) && (p1 < MAX_REMOTE)) tmp_rc = rc[p1];
+      else if (param1 == "rx") tmp_rc = rx_rc;
+      else if (param1 == "tx") tmp_rc = tx_rc;
+      if (tmp_rc.encryptionkey != 0xff) {
+        if ((p2 >= 0) && (p2 < MAX_REMOTE)) rc[p2] = tmp_rc;
+        else if (param2 == "rx") rx_rc = tmp_rc;
+        else if (param2 == "tx") tx_rc = tmp_rc;
       }
     }
-  }
-  if (cmd == "save") data_save();
-  if (cmd == "load") data_load();
-  if ((cmd == "rcedit") || (cmd == "rced")) {
-    if (param1 == "rid") tx_rc.remoteid = p2;
-    if (param1 == "cid") tx_rc.channelid = p2;
-    if (param1 == "rc") tx_rc.rollingcode = p2;
-    if (param1 == "ac") tx_rc.actionid = p2;
-    if (param1 == "enc") tx_rc.encryptionkey = p2;
-    if (param1 == "proto" and param2 == "56") tx_rc.newprotocol = false;
-    if (param1 == "proto" and param2 == "80") tx_rc.newprotocol = true;
-  }
-  if ((cmd == "devedit") || (cmd == "ded")) {
-    if ((p2 > 0) && (p2 < MAX_SHUTTER)) {
-      if ((param1 == "cmd") && (p3 >= 0) && (p3 < MAX_REMOTE)) { shut[p2].rc_cmd_id = p3; }
-      if ((param1 == "opt") && (p3 >= 0) && (p3 <= 100)) shut[p2].op_time = p3;
-      if ((param1 == "pos") && (p3 >= 0) && (p3 <= 100)) { shut[p2].position = p3; shut[p2].send_position = true; }
+    if ((cmd == "roll") || (cmd == "rl")) {
+      if ((p1 >= 0) && (p1 < MAX_REMOTE)) do_rolling(&rc[p1]);
+      else if (param1 == "rx") do_rolling(&rx_rc);
+      else if (param1 == "tx") do_rolling(&tx_rc);
     }
-  }
-  if (cmd == "send") {
-      send_frame(&tx_rc, 2);
+    if ((cmd == "link") || (cmd == "ln")) {
+      if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
+        if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
+          int cmd_idx = -1;
+          for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) cmd_idx = idx;
+          if (cmd_idx < 0) for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == 0xff) { cmd_idx = idx; break; }
+          if (cmd_idx >= 0) shut[p2].rc_aux_id[cmd_idx] = p1;
+        }
+      }
+    }
+    if ((cmd == "unlink") || (cmd == "ul")) {
+      if ((p1 >= 0) && (p1 < MAX_REMOTE)) {
+        if ((p2 >= 0) && (p2 < MAX_SHUTTER)) {
+          for (uint8_t idx = 0; idx < MAX_AUX; idx++) if (shut[p2].rc_aux_id[idx] == p1) shut[p2].rc_aux_id[idx] = 0xff;
+        }
+      }
+    }
+    if (cmd == "save") data_save();
+    if (cmd == "load") data_load();
+    if ((cmd == "rcedit") || (cmd == "rced")) {
+      if (param1 == "rid") tx_rc.remoteid = p2;
+      if (param1 == "cid") tx_rc.channelid = p2;
+      if (param1 == "rc") tx_rc.rollingcode = p2;
+      if (param1 == "ac") tx_rc.actionid = p2;
+      if (param1 == "enc") tx_rc.encryptionkey = p2;
+      if (param1 == "proto" and param2 == "56") tx_rc.newprotocol = false;
+      if (param1 == "proto" and param2 == "80") tx_rc.newprotocol = true;
+      if (param1 == "timing" and param2 == "new") tx_rc.newtiming = true;
+      if (param1 == "timing" and param2 == "old") tx_rc.newtiming = false;
+    }
+    if ((cmd == "devedit") || (cmd == "ded")) {
+      if ((p2 > 0) && (p2 < MAX_SHUTTER)) {
+        if ((param1 == "cmd") && (p3 >= 0) && (p3 < MAX_REMOTE)) { shut[p2].rc_cmd_id = p3; }
+        if ((param1 == "opt") && (p3 >= 0) && (p3 <= 100)) shut[p2].op_time = p3;
+        if ((param1 == "pos") && (p3 >= 0) && (p3 <= 100)) { shut[p2].position = p3; shut[p2].send_position = true; }
+      }
+    }
+    if (cmd == "send") {
+        send_frame(&tx_rc, 2);
+    }
+    if ((cmd == "disable") || (cmd == "dis") || (cmd == "exit")) {
+      cmd_enabled = false;
+      cli_print("Command mode disabled", true);
+    }
+  } else {
+    if ((cmd == "enable") || (cmd == "en")) {
+      if (param1 == "pwd123") {
+        cmd_enabled = true;
+        cli_print("Command mode enabled", true);
+      } else cli_print("Not authorized", true);
+    } else cli_print("Not authorized", true);
   }
 }
 
+/*
 void process_serial() {
 
   if (dbgdsp.length() > 0) {
@@ -744,6 +790,65 @@ void process_serial() {
         if (line.length() < 80) {
           line += ch;
           Serial.print(ch);
+        }
+        break;
+    }
+  }
+}
+*/
+
+void process_cli(bool ser=false, bool net=false) {
+
+  if (dbgdsp.length() > 0) {
+      for (unsigned int idx = 0; idx < 2+line.length(); idx++) cli_print("\b \b", false, ser, net);
+      uptime_to_text("[", " ] ");
+      cli_print(uptime_txt, false, ser, net);
+      cli_print(dbgdsp.c_str(), true, ser, net);
+      dbgdsp = "";
+      cli_print("> ", false, ser, net);
+      cli_print(line.c_str(), false, ser, net);
+  }
+
+   if ((ser && Serial.available()) || (net && netcli_connected && cli_client.available())) {
+    char ch = 0x00;
+    bool fromserial = false;
+    bool fromnet = false;
+    if (ser && Serial.available()) { ch = Serial.read(); fromserial = true; }
+    if (net && netcli_connected && cli_client.available()) { ch = cli_client.read(); fromnet = true; }
+
+    if (fromnet)
+    switch (ch)
+    {
+      case 0xff: // telnet IAC
+          break;
+      case 0xfb: case 0xfc: case 0xfd: case 0xfe:  // telnet iac cmd
+          if (netcli_connected && cli_client.available()) ch = cli_client.read(); // remove IAC command option if any
+          break;
+    }
+    if (fromnet || fromserial) switch (ch)
+    {
+    case '\r': // CR
+    case 0x2d : // Ctrl-M
+        cli_print("", true, ser, net);
+        exec_cmd();
+        cli_print("> ", ser, net);
+        line = "";
+        break;
+    case '\n': break;
+    case '\b':
+    case 0x7f:
+    case 0x28: // Ctrl-H
+        if (line.length() > 0) {
+            line.pop_back();
+            cli_print("\b \b", ser, net);
+        }
+        break;
+    case 0x00:
+        break;
+    default:
+        if (line.length() < 80) {
+          line += ch;
+          cli_print(String(ch), false, ser, net&fromserial);  // print only to serial, net is already echoed unless coming from serial
         }
         break;
     }
@@ -868,6 +973,10 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PSK);
 
+  // Init OTA
+  OTAsetup();
+  OTAbegin();
+
 }
 
 
@@ -893,6 +1002,8 @@ void loop() {
         dbgdsp.append(WiFi.localIP().toString().c_str());
         mqtt_client.setServer(MQTT_IP, 1883);
         mqtt_client.setCallback(mqtt_callback);
+        // start telnet server
+        cli_server.begin();
       }
     }
     else {
@@ -928,7 +1039,8 @@ void loop() {
 
   // every loop processing
   mqtt_client.loop();
-  process_serial();
+  //process_serial();
+  process_cli(false, true);
 
   // once per loop processing
   switch (loopidx++)
@@ -947,6 +1059,38 @@ void loop() {
     break;
   case 4:
     process_mqtt();
+    break;
+  case 5:
+    OTAhandle();
+    break;
+  case 6:
+    // Management client
+    if (!netcli_connected) { cli_client = cli_server.accept(); }
+    if (cli_client) {
+      if (cli_client.connected()) {
+        if (netcli_disconnect == true) {
+          netcli_connected = false;
+          netcli_disconnect = false;
+          dbgdsp = "Network client disconnected";
+          cli_client.stop();
+        } else
+        if (netcli_connected == false) {
+          netcli_connected = true;
+          netcli_disconnect = false;
+          dbgdsp = "Network client connected";
+          cli_client.write(0xFF);
+          cli_client.write(0xFC);
+          cli_client.write(0x22);
+        }
+      }
+      if (!cli_client.connected()) {
+        netcli_connected = false;
+        dbgdsp = "Network client lost";
+      }
+    } else if (netcli_connected) {
+      netcli_connected = false;
+      dbgdsp = "Network client lost";
+    }
     break;
 
   default:
