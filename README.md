@@ -110,11 +110,11 @@ Uptime         :    0d 02h:46m:16s
 
 ## MQTT
 - Send command through MQTT:
-  - /home-assistant/cover/*cover number (0..9)*/**set**  -->  OPEN / CLOSE / STOP
+  - /home/cover/*cover number (0..9)*/**set**  -->  OPEN / CLOSE / STOP
 - Get status from MQTT:
-  - /home-assistant/cover/*cover number (0..9)*/**position**  --> 0..100
-  - /home-assistant/cover/*cover number (0..9)*/**state**   -->  open / opening / closed / closing
-  - /home-assistant/cover/*cover number (0..9)*/**availability**  -->  online / offline
+  - /home/cover/*cover number (0..9)*/**position**  --> 0..100
+  - /home/cover/*cover number (0..9)*/**state**   -->  open / opening / closed / closing
+  - /home/cover/*cover number (0..9)*/**availability**  -->  online / offline
  
 Sample Home Assistant yaml config:
 ```
